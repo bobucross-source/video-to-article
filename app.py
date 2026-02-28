@@ -4,6 +4,7 @@
 完全無料：Gemini API（文字起こし＋記事生成）
 """
 
+import io
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import subprocess
 import tempfile
 import shutil
 import base64
+import zipfile
 from pathlib import Path
 
 import streamlit as st
@@ -29,13 +31,6 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stApp { max-width: 800px; margin: 0 auto; }
-    .success-box {
-        background: #f0fdf4;
-        border: 1px solid #86efac;
-        border-radius: 12px;
-        padding: 20px;
-        margin: 16px 0;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -45,7 +40,6 @@ GUIDE_PATH = SCRIPT_DIR / "つかいかた.md"
 
 
 def check_ffmpeg():
-    """FFmpegが使えるか確認。なければインストールを試みる"""
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
         return True
@@ -54,7 +48,6 @@ def check_ffmpeg():
 
 
 def install_ffmpeg():
-    """Streamlit Cloud (Debian/Ubuntu) に FFmpeg をインストール"""
     try:
         subprocess.run(["apt-get", "update", "-qq"], capture_output=True)
         subprocess.run(["apt-get", "install", "-y", "-qq", "ffmpeg"], capture_output=True)
@@ -114,7 +107,6 @@ def transcribe_audio_gemini(audio_path):
 
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-    # 音声ファイルを読み込み
     with open(audio_path, "rb") as f:
         audio_data = f.read()
 
@@ -147,19 +139,15 @@ def transcribe_audio_gemini(audio_path):
         ],
     )
 
-    # レスポンスからJSON部分を抽出
     response_text = response.text.strip()
-    # コードブロックで囲まれている場合は除去
     if response_text.startswith("```"):
         lines = response_text.split("\n")
-        # 最初と最後の ```行を除去
         lines = [l for l in lines if not l.strip().startswith("```")]
         response_text = "\n".join(lines)
 
     try:
         transcription = json.loads(response_text)
     except json.JSONDecodeError:
-        # JSONパースに失敗した場合は、テキスト全体をフルテキストとして扱う
         transcription = {
             "full_text": response_text,
             "segments": [{"start": 0.0, "end": 0.0, "text": response_text}],
@@ -188,7 +176,6 @@ def generate_article(transcription, frames, video_filename, custom_prompt=""):
         for s in transcription["segments"]
     )
 
-    # カスタムプロンプトがあれば追加要件として組み込む
     custom_section = ""
     if custom_prompt.strip():
         custom_section = f"""
@@ -228,22 +215,19 @@ Markdown形式の記事を出力してください。コードブロックで囲
     return response.text
 
 
-def generate_preview_html(article_content, frames_dir):
+def generate_preview_html(article_content, frames_data):
     """HTMLプレビューを生成（画像をbase64で埋め込み、完全スタンドアロン）"""
     import markdown as md
 
-    # 画像をbase64に変換してMarkdown内のパスを置換
     def replace_image_with_base64(match):
         alt = match.group(1)
         img_path = match.group(2)
-        full_path = os.path.join(frames_dir, os.path.basename(img_path))
-        if os.path.exists(full_path):
-            with open(full_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
+        fname = os.path.basename(img_path)
+        if fname in frames_data:
+            b64 = base64.b64encode(frames_data[fname]).decode()
             return f'![{alt}](data:image/jpeg;base64,{b64})'
         return match.group(0)
 
-    # 画像パスをbase64に置換
     article_with_b64 = re.sub(
         r'!\[([^\]]*)\]\((frames/[^)]+)\)',
         replace_image_with_base64,
@@ -292,17 +276,45 @@ def generate_preview_html(article_content, frames_dir):
     return html
 
 
-def display_article(article, frames_dir):
-    """記事を画像参照で分割し、テキストはmarkdown、画像はst.imageで表示"""
+def create_edit_zip(article_content, frames_data, video_name):
+    """修正用ZIPファイルを作成（article.md + frames/）"""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        # article.md
+        zf.writestr(f"{video_name}_記事/article.md", article_content)
+        # frames
+        for fname, fdata in frames_data.items():
+            zf.writestr(f"{video_name}_記事/frames/{fname}", fdata)
+        # 説明書
+        readme = """# 記事の修正方法
+
+1. article.md をテキストエディタで開いて編集してください
+2. 画像は frames/ フォルダに入っています
+3. 不要な画像行を削除すれば画像を減らせます
+
+## 画像の参照形式
+![説明テキスト](frames/frame_0001_10s.jpg)
+↑ この行を削除すると、その画像が記事から消えます
+"""
+        zf.writestr(f"{video_name}_記事/修正方法.txt", readme)
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
+def display_article_from_session():
+    """session_stateに保存された記事を表示"""
+    article = st.session_state["result_article"]
+    frames_data = st.session_state["result_frames_data"]
+
     parts = re.split(r'(!\[[^\]]*\]\(frames/[^)]+\))', article)
     for part in parts:
         img_match = re.match(r'!\[([^\]]*)\]\(frames/([^)]+)\)', part)
         if img_match:
             alt = img_match.group(1)
             fname = img_match.group(2)
-            frame_path = os.path.join(frames_dir, fname)
-            if os.path.exists(frame_path):
-                st.image(frame_path, caption=alt)
+            if fname in frames_data:
+                st.image(frames_data[fname], caption=alt)
         elif part.strip():
             st.markdown(part, unsafe_allow_html=True)
 
@@ -369,7 +381,6 @@ with tab_convert:
 
         if st.button("🚀 記事に変換する", type="primary", use_container_width=True):
 
-            # 一時ディレクトリに保存
             tmp_dir = tempfile.mkdtemp()
             tmp_video = os.path.join(tmp_dir, uploaded_file.name)
             with open(tmp_video, "wb") as f:
@@ -382,61 +393,39 @@ with tab_convert:
             progress = st.progress(0, text="準備中...")
 
             try:
-                # Step 1: 音声抽出
+                # Step 1
                 progress.progress(10, text="🔊 [1/4] 音声を抽出中...")
                 audio_path = extract_audio(tmp_video, output_dir)
 
-                # Step 2: フレーム抽出
+                # Step 2
                 progress.progress(25, text="📸 [2/4] スクリーンショットを抽出中...")
                 frames = extract_frames(tmp_video, output_dir, interval=interval)
 
-                # Step 3: 文字起こし（Gemini）
+                # Step 3
                 progress.progress(45, text="✍️ [3/4] 音声を文字起こし中（Gemini API）...")
                 transcription = transcribe_audio_gemini(audio_path)
 
-                # Step 4: 記事生成
+                # Step 4
                 progress.progress(75, text="📝 [4/4] 記事を生成中...")
                 article = generate_article(transcription, frames, video_name, custom_prompt)
 
                 progress.progress(100, text="✅ 変換完了！")
 
-                # --- 結果表示 ---
-                st.balloons()
-                st.success("🎉 記事が完成しました！")
-
-                # HTMLダウンロードボタン
+                # フレーム画像をバイトデータとしてメモリに保存
+                frames_data = {}
                 frames_dir = os.path.join(output_dir, "frames")
-                preview_html = generate_preview_html(article, frames_dir)
+                for f in frames:
+                    fpath = os.path.join(frames_dir, f["filename"])
+                    if os.path.exists(fpath):
+                        with open(fpath, "rb") as fp:
+                            frames_data[f["filename"]] = fp.read()
 
-                st.download_button(
-                    label="📥 記事をHTMLでダウンロード",
-                    data=preview_html,
-                    file_name=f"{video_name}_記事.html",
-                    mime="text/html",
-                    use_container_width=True,
-                )
-
-                st.caption("💡 ダウンロードしたHTMLファイルをダブルクリックで、画像付きの記事がブラウザで見れます")
-
-                # Markdownダウンロード
-                st.download_button(
-                    label="📥 記事をMarkdownでダウンロード",
-                    data=article,
-                    file_name=f"{video_name}_記事.md",
-                    mime="text/markdown",
-                )
-
-                # 記事プレビュー
-                st.divider()
-                st.subheader("📄 生成された記事")
-                display_article(article, frames_dir)
-
-                # 統計情報
-                st.divider()
-                col1, col2, col3 = st.columns(3)
-                col1.metric("セグメント数", f"{len(transcription['segments'])}")
-                col2.metric("スクリーンショット", f"{len(frames)}枚")
-                col3.metric("料金", "¥0")
+                # session_stateに結果を保存（ダウンロード後も維持するため）
+                st.session_state["result_article"] = article
+                st.session_state["result_frames_data"] = frames_data
+                st.session_state["result_video_name"] = video_name
+                st.session_state["result_segments"] = len(transcription["segments"])
+                st.session_state["result_frames_count"] = len(frames)
 
             except Exception as e:
                 progress.empty()
@@ -446,13 +435,64 @@ with tab_convert:
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    else:
+    # --- 結果表示（session_stateから復元） ---
+    if "result_article" in st.session_state:
+        article = st.session_state["result_article"]
+        frames_data = st.session_state["result_frames_data"]
+        video_name = st.session_state["result_video_name"]
+
+        st.success("🎉 記事が完成しました！")
+
+        # ダウンロードボタン
+        st.markdown("### 📥 ダウンロード")
+
+        col_dl1, col_dl2 = st.columns(2)
+
+        with col_dl1:
+            preview_html = generate_preview_html(article, frames_data)
+            st.download_button(
+                label="📄 完成版（HTML）",
+                data=preview_html,
+                file_name=f"{video_name}_記事.html",
+                mime="text/html",
+                use_container_width=True,
+                help="画像埋め込み済み。ダブルクリックでブラウザで見れます",
+            )
+
+        with col_dl2:
+            edit_zip = create_edit_zip(article, frames_data, video_name)
+            st.download_button(
+                label="✏️ 修正用（ZIP）",
+                data=edit_zip,
+                file_name=f"{video_name}_修正用.zip",
+                mime="application/zip",
+                use_container_width=True,
+                help="article.md + 画像フォルダ。テキストエディタで記事を修正できます",
+            )
+
+        st.caption("💡 **完成版HTML** → そのまま見る用 / **修正用ZIP** → 記事を編集したい時")
+
+        # 記事プレビュー
+        st.divider()
+        st.subheader("📄 生成された記事プレビュー")
+        display_article_from_session()
+
+        # 統計情報
+        st.divider()
+        col1, col2, col3 = st.columns(3)
+        col1.metric("セグメント数", f"{st.session_state['result_segments']}")
+        col2.metric("スクリーンショット", f"{st.session_state['result_frames_count']}枚")
+        col3.metric("料金", "¥0")
+
+    elif uploaded_file is None:
         st.markdown("""
         ### 使い方
         1. 上のエリアに **動画ファイルをドラッグ＆ドロップ**
         2. **「記事に変換する」** ボタンを押す
         3. 数分待つと記事が完成！
-        4. **HTMLでダウンロード** → ダブルクリックで画像付き記事が見れる
+        4. **ダウンロード**
+           - 📄 **完成版HTML** → ダブルクリックで画像付き記事が見れる
+           - ✏️ **修正用ZIP** → article.md を編集して記事を修正できる
 
         ### 完全無料で動作します
         - 🎤 文字起こし: Gemini API（無料枠）
@@ -473,8 +513,9 @@ with tab_guide:
         1. **「動画を変換」タブ** を開く
         2. 動画ファイルをドラッグ＆ドロップ
         3. **「記事に変換する」** ボタンを押す
-        4. 完成したら **HTMLでダウンロード**
-        5. ダウンロードしたファイルをダブルクリックで記事が見れます
+        4. 完成したら **ダウンロード**
+           - 📄 完成版HTML → ダブルクリックでブラウザで見れる
+           - ✏️ 修正用ZIP → article.md を編集して記事を修正
 
         ### 対応形式
         MP4, MOV, AVI, MKV, WebM
